@@ -324,3 +324,26 @@ if __name__ == "__main__":
     # Save
     model.save("models/phishing_hitech_v1.joblib")
     print("Saved -> models/phishing_hitech_v1.joblib")
+
+# from phishing_hitech import HighTechPhish
+import joblib
+from phishing_hitech import HighTechPhish
+
+# Load high-tech model
+ht = HighTechPhish().load("models/phishing_hitech_v1.joblib")
+
+def analyze_email():
+    text = textbox.get("1.0", tk.END).strip()
+    if not text:
+        messagebox.showwarning("Input Error", "Please paste some email text!")
+        return
+    proba = float(ht.predict_proba([text])[0])
+    prediction = int(proba >= ht.threshold)
+    msg = f"Prob(phishing) = {proba:.2f}\n"
+    if prediction == 1:
+        result = "⚠️ Warning: PHISHING"
+        color = "red"
+    else:
+        result = "✅ Looks LEGIT"
+        color = "green"
+    result_label.config(text=msg + result, fg=color)
