@@ -1,0 +1,326 @@
+# file: phishing_hitech.py
+# pip install scikit-learn joblib pandas numpy transformers torch regex beautifulsoup4 tldextract
+import re, os, time, joblib, math, warnings, json
+import numpy as np
+import pandas as pd
+from bs4 import BeautifulSoup
+import tldextract
+from typing import List, Dict, Any
+
+from sklearn.model_selection import train_test_split
+from sklearn.feature_extraction.text import TfidfVectorizer
+from sklearn.preprocessing import StandardScaler
+from sklearn.pipeline import Pipeline, FeatureUnion
+from sklearn.svm import LinearSVC
+from sklearn.linear_model import LogisticRegression
+from sklearn.ensemble import RandomForestClassifier
+from sklearn.calibration import CalibratedClassifierCV
+from sklearn.metrics import classification_report, precision_recall_fscore_support, roc_auc_score
+
+warnings.filterwarnings("ignore")
+
+# -------------------- Adversarial-Aware Normalization --------------------
+ZERO_WIDTH = r"[\u200b\u200c\u200d\u2060]"
+HOMOGLYPHS = {
+    "а":"a","е":"e","о":"o","р":"p","с":"c","х":"x","і":"i","ί":"i","Ι":"I","Ο":"O","Β":"B",
+    "ϵ":"e","ί":"i","ⅼ":"l","Ｓ":"S","０":"0","１":"1","５":"5"
+}
+def normalize_text(x:str)->str:
+    if not isinstance(x,str): x=str(x)
+    s = re.sub(ZERO_WIDTH,"",x)                 # remove zero-width
+    s = s.encode("utf-8","ignore").decode("utf-8")
+    # unicode homoglyph map
+    s = "".join(HOMOGLYPHS.get(ch, ch) for ch in s)
+    # collapse spaces & lowercase
+    s = re.sub(r"\s+"," ",s).strip().lower()
+    return s
+
+# Simple adversarial augmentations for training hardening
+def adversarial_augs(text:str)->List[str]:
+    t = normalize_text(text)
+    augs = [t]
+    # insert random dots in domain-like tokens
+    augs.append(re.sub(r"(http[s]?://)(\w)", r"\1.\2", t))
+    # replace o->0, i->1 in urls
+    augs.append(re.sub(r"([a-z])", lambda m: {"o":"0","i":"1"}.get(m.group(1), m.group(1)), t))
+    # add spaces around punctuation
+    augs.append(re.sub(r"([:/._-])", r" \1 ", t))
+    return list({x for x in augs if x})
+
+# -------------------- Security Heuristic Features --------------------
+SUSP_TLDS = {".ru",".xyz",".top",".click",".work",".zip",".kim",".cn",".gq",".tk",".ml",".cf"}
+URGENT_WORDS = {"verify","urgent","update","password","suspend","limited","expire","confirm","now","immediately","login"}
+BRAND_BAIT = {"microsoft","office365","netflix","amazon","apple","paypal","facebook","instagram","bank","upi","aadhaar"}
+
+URL_RE = re.compile(r'https?://[^\s<>\)"]+')
+def url_features(text:str)->Dict[str,float]:
+    urls = URL_RE.findall(text)
+    num_urls = len(urls)
+    feats = dict(
+        has_url = 1 if num_urls>0 else 0,
+        num_urls = float(num_urls),
+        max_url_len = float(max((len(u) for u in urls), default=0)),
+        avg_url_len = float(np.mean([len(u) for u in urls]) if urls else 0.0),
+        suspicious_tld = 0.0,
+        has_ip_url = 0.0,
+    )
+    for u in urls:
+        ext = tldextract.extract(u)
+        tld = "." + (ext.suffix or "")
+        if tld in SUSP_TLDS: feats["suspicious_tld"] = 1.0
+        # IP in host?
+        if re.search(r'://\d{1,3}(\.\d{1,3}){3}', u): feats["has_ip_url"] = 1.0
+    return feats
+
+def html_features(text:str)->Dict[str,float]:
+    soup = BeautifulSoup(text, "html.parser")
+    html_len = len(text)
+    num_links = len(soup.find_all("a"))
+    num_forms = len(soup.find_all("form"))
+    num_inputs = len(soup.find_all("input"))
+    has_onclick = 1.0 if "onclick" in text.lower() else 0.0
+    return dict(
+        html_len=float(html_len),
+        num_links=float(num_links),
+        num_forms=float(num_forms),
+        num_inputs=float(num_inputs),
+        has_onclick=has_onclick
+    )
+
+def lexical_features(text:str)->Dict[str,float]:
+    t = normalize_text(text)
+    words = re.findall(r"[a-z0-9]+", t)
+    word_len = [len(w) for w in words] or [0]
+    urgent = sum(t.count(w) for w in URGENT_WORDS)
+    brand = sum(1 for w in BRAND_BAIT if w in t)
+    digits = sum(c.isdigit() for c in t)
+    return dict(
+        num_tokens=float(len(words)),
+        avg_token_len=float(np.mean(word_len)),
+        num_digits=float(digits),
+        urgent_hits=float(urgent),
+        brand_bait=float(brand)
+    )
+
+SEC_KEYS = [
+    "has_url","num_urls","max_url_len","avg_url_len","suspicious_tld","has_ip_url",
+    "html_len","num_links","num_forms","num_inputs","has_onclick",
+    "num_tokens","avg_token_len","num_digits","urgent_hits","brand_bait"
+]
+def security_feature_matrix(texts:List[str])->np.ndarray:
+    rows=[]
+    for t in texts:
+        u = url_features(t)
+        h = html_features(t)
+        l = lexical_features(t)
+        row = {**u, **h, **l}
+        rows.append([row[k] for k in SEC_KEYS])
+    return np.asarray(rows, dtype=float)
+
+# -------------------- Transformer Embeddings --------------------
+# Small, fast model for CLS embedding
+from transformers import AutoTokenizer, AutoModel
+class TransformerEncoder:
+    def __init__(self, name:str="distilbert-base-uncased", max_len:int=256, device:str="cpu"):
+        self.name = name
+        self.tok = AutoTokenizer.from_pretrained(name)
+        self.model = AutoModel.from_pretrained(name)
+        self.model.eval()
+        self.max_len = max_len
+        self.device = device
+        self.model.to(device)
+
+    @torch.inference_mode()
+    def encode(self, texts:List[str])->np.ndarray:
+        import torch
+        toks = self.tok(texts, padding=True, truncation=True, max_length=self.max_len, return_tensors="pt")
+        toks = {k:v.to(self.device) for k,v in toks.items()}
+        out = self.model(**toks)
+        # Use [CLS] token or mean pooling if CLS not available
+        if hasattr(out, "last_hidden_state"):
+            x = out.last_hidden_state.mean(dim=1)  # mean pool
+        else:
+            x = out[0].mean(dim=1)
+        return x.cpu().numpy().astype(np.float32)
+
+# Lazy import torch to avoid top-level requirement errors in some envs
+import importlib
+torch = importlib.import_module("torch")
+
+# -------------------- Vectorizers & Models --------------------
+char_tfidf = TfidfVectorizer(
+    analyzer="char",
+    ngram_range=(3,5),      # robust to obfuscation
+    min_df=1
+)
+
+# Base learners
+base_linear_svc = LinearSVC(C=1.0, class_weight="balanced")
+base_linear_svc_cal = CalibratedClassifierCV(base_linear_svc, method="sigmoid", cv=3)  # get proba
+
+base_rf = RandomForestClassifier(n_estimators=400, max_depth=None, n_jobs=-1, class_weight="balanced")
+
+meta_lr = LogisticRegression(max_iter=1000, class_weight="balanced")
+
+# -------------------- End-to-End High-Tech Model --------------------
+class HighTechPhish:
+    def __init__(self, threshold:float=0.35, device:str="cpu"):
+        """
+        threshold: probability above which we mark as phishing (lower -> more sensitive)
+        """
+        self.threshold = threshold
+        self.scaler = StandardScaler()
+        self.encoder = TransformerEncoder(device=device)
+        self.fitted = False
+
+    def _prepare_views(self, X:List[str]):
+        texts_norm = [normalize_text(x) for x in X]
+        # View 1: char TF-IDF
+        v1 = self.tfidf.transform(texts_norm)
+        # View 2: security numeric
+        sec = security_feature_matrix(X)
+        v2 = self.scaler.transform(sec)
+        # View 3: transformer
+        v3 = self.encoder.encode(X)
+        return v1, v2, v3
+
+    def fit(self, X:List[str], y:List[int], augment:bool=True):
+        # Build augmented training set
+        X_aug, y_aug = [], []
+        for t, label in zip(X, y):
+            variants = adversarial_augs(t) if augment else [t]
+            X_aug.extend(variants); y_aug.extend([label]*len(variants))
+
+        # Fit char TF-IDF
+        self.tfidf = char_tfidf.fit([normalize_text(x) for x in X_aug])
+        # Fit security scaler
+        sec = security_feature_matrix(X_aug)
+        self.scaler.fit(sec)
+        # Prepare views
+        v1 = self.tfidf.transform([normalize_text(x) for x in X_aug])
+        v2 = self.scaler.transform(sec)
+        v3 = self.encoder.encode(X_aug)
+
+        # Base models
+        self.clf_tfidf = base_linear_svc_cal.fit(v1, y_aug)
+        self.clf_sec   = base_rf.fit(v2, y_aug)
+        # Reduce dimensionality for v3 via logistic (acts as base)
+        self.clf_bert  = LogisticRegression(max_iter=1000, class_weight="balanced").fit(v3, y_aug)
+
+        # Meta stacking features = probs from bases
+        p1 = self.clf_tfidf.predict_proba(v1)[:,1]
+        p2 = self.clf_sec.predict_proba(v2)[:,1]
+        p3 = self.clf_bert.predict_proba(v3)[:,1]
+        P = np.vstack([p1,p2,p3]).T
+        self.meta = meta_lr.fit(P, y_aug)
+        self.fitted = True
+        return self
+
+    def predict_proba(self, X:List[str])->np.ndarray:
+        assert self.fitted, "Model not trained. Call fit() or load() first."
+        v1, v2, v3 = self._prepare_views(X)
+        p1 = self.clf_tfidf.predict_proba(v1)[:,1]
+        p2 = self.clf_sec.predict_proba(v2)[:,1]
+        p3 = self.clf_bert.predict_proba(v3)[:,1]
+        P = np.vstack([p1,p2,p3]).T
+        p = self.meta.predict_proba(P)[:,1]
+        return p
+
+    def predict(self, X:List[str])->np.ndarray:
+        p = self.predict_proba(X)
+        return (p >= self.threshold).astype(int)
+
+    def explain(self, X:List[str], top_k:int=8)->List[Dict[str,Any]]:
+        """
+        Lightweight explanation: top char n-grams (coef), security feats, and brand/urgent hits.
+        """
+        out=[]
+        for text in X:
+            t = normalize_text(text)
+            # TF-IDF top signals
+            resp = {}
+            try:
+                vec = self.tfidf.transform([t])
+                coefs = self.clf_tfidf.base_estimator.coef_.toarray()[0]
+                # grab top positive n-grams present
+                idx = vec.nonzero()[1]
+                contrib = [(self.tfidf.get_feature_names_out()[i], float(coefs[i]*vec[0, i])) for i in idx]
+                contrib_sorted = sorted(contrib, key=lambda z: z[1], reverse=True)[:top_k]
+                resp["top_char_ngrams"] = contrib_sorted
+            except Exception:
+                resp["top_char_ngrams"] = []
+            # security feats
+            sec = {k:v for k,v in zip(SEC_KEYS, security_feature_matrix([text])[0].tolist())}
+            resp["security_feats"] = {k: float(sec[k]) for k in SEC_KEYS}
+            # brand/urgent extracted
+            resp["urgent_hits"] = sum(t.count(w) for w in URGENT_WORDS)
+            resp["brands_found"] = [b for b in BRAND_BAIT if b in t]
+            out.append(resp)
+        return out
+
+    def save(self, path:str):
+        os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+        blob = dict(
+            threshold=self.threshold,
+            tfidf=self.tfidf,
+            scaler=self.scaler,
+            clf_tfidf=self.clf_tfidf,
+            clf_sec=self.clf_sec,
+            clf_bert=self.clf_bert,
+            meta=self.meta,
+            encoder_name=self.encoder.name,
+        )
+        joblib.dump(blob, path)
+
+    def load(self, path:str, device:str="cpu"):
+        blob = joblib.load(path)
+        self.threshold = blob["threshold"]
+        self.tfidf = blob["tfidf"]
+        self.scaler = blob["scaler"]
+        self.clf_tfidf = blob["clf_tfidf"]
+        self.clf_sec = blob["clf_sec"]
+        self.clf_bert = blob["clf_bert"]
+        self.meta = blob["meta"]
+        self.encoder = TransformerEncoder(name=blob.get("encoder_name","distilbert-base-uncased"), device=device)
+        self.fitted = True
+        return self
+
+# -------------------- Demo / Training --------------------
+if __name__ == "__main__":
+    # Tiny illustrative dataset (replace with your CSV)
+    data = pd.DataFrame([
+        {"text": "Verify your Microsoft account urgently: http://bad.link/login", "label": 1},
+        {"text": "Team meeting at 3 PM. Agenda attached.", "label": 0},
+        {"text": "Your package is on hold. Update payment now: http://suspicious.ru/pay", "label": 1},
+        {"text": "Invoice for last month attached. Thank you.", "label": 0},
+        {"text": '<html><body>Reset your password <a href="http://secure-update.xyz/reset">here</a></body></html>', "label": 1},
+        {"text": "Dinner at 8? Bring the sweets.", "label": 0},
+        {"text": "⚠ Your account will be suspended. Confirm now: http://203.10.10.5/secure", "label": 1},
+        {"text": "Project status: all green. Next review Monday.", "label": 0},
+    ])
+
+    X = data["text"].tolist()
+    y = data["label"].tolist()
+
+    X_tr, X_te, y_tr, y_te = train_test_split(X, y, test_size=0.35, random_state=42, stratify=y)
+
+    model = HighTechPhish(threshold=0.35, device="cpu")
+    model.fit(X_tr, y_tr, augment=True)
+
+    # Evaluate with calibrated probabilities
+    probs = model.predict_proba(X_te)
+    preds = (probs >= model.threshold).astype(int)
+    print(classification_report(y_te, preds, digits=3))
+    try:
+        auc = roc_auc_score(y_te, probs)
+        print("ROC-AUC:", round(auc, 3))
+    except Exception:
+        pass
+
+    # Explain a couple of examples
+    exps = model.explain(X_te[:2], top_k=6)
+    print("EXPLANATIONS:", json.dumps(exps, indent=2))
+
+    # Save
+    model.save("models/phishing_hitech_v1.joblib")
+    print("Saved -> models/phishing_hitech_v1.joblib")
