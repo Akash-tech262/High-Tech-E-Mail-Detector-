@@ -1,0 +1,33 @@
+# pip install scikit-learn numpy pandas
+import numpy as np, pandas as pd
+from sklearn.ensemble import IsolationForest
+
+# synthetic "normal" flows
+rng = np.random.default_rng(42)
+normal = pd.DataFrame({
+    "src_bytes": rng.normal(5_000, 1_000, 500).clip(100, None),
+    "dst_bytes": rng.normal(4_000, 800, 500).clip(100, None),
+    "packets":   rng.normal(50, 10, 500).clip(1, None),
+    "duration":  rng.normal(3.0, 0.7, 500).clip(0.05, None),
+})
+
+# inject anomalies
+anoms = pd.DataFrame({
+    "src_bytes": rng.normal(200_000, 40_000, 10),
+    "dst_bytes": rng.normal(10_000, 2_000, 10),
+    "packets":   rng.integers(5, 15, 10),
+    "duration":  rng.normal(0.2, 0.05, 10).clip(0.01, None),
+})
+
+df = pd.concat([normal, anoms], ignore_index=True)
+
+model = IsolationForest(n_estimators=300, contamination=0.02, random_state=42)
+model.fit(df)
+
+scores = -model.score_samples(df)  # higher = more anomalous
+df_out = df.copy()
+df_out["anomaly_score"] = scores
+df_out["is_anomaly"] = (scores > np.quantile(scores, 0.98)).astype(int)
+
+# show most suspicious
+print(df_out.sort_values("anomaly_score", ascending=False).head(15))
