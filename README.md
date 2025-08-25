@@ -34,3 +34,7 @@ pred = pipe.predict(X_test)
 print(classification_report(y_test, pred, digits=3))
 
 joblib.dump(pipe, "phishing_model.joblib")
+
+RUN
+
+streamlit run app_streamlit.py
