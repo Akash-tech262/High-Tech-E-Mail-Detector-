@@ -347,3 +347,159 @@ def analyze_email():
         result = "✅ Looks LEGIT"
         color = "green"
     result_label.config(text=msg + result, fg=color)
+file: app_streamlit.py
+
+Streamlit GUI for High-Tech Phishing Detector (v3)
+
+Features:
+
+- Paste email text OR upload .eml/.txt OR batch CSV with a text column
+
+- Loads high-tech model (phishing_hitech_v1.joblib), or trains a tiny fallback model if missing
+
+- Shows probability, decision, and lightweight explanations (top n-grams + security features)
+
+- Threshold slider & batch scoring download
+
+- URL table extracted from email
+
+
+
+Usage:
+
+1) pip install streamlit scikit-learn joblib pandas numpy transformers torch regex beautifulsoup4 tldextract email_validator
+
+2) Ensure phishing_hitech.py and models/phishing_hitech_v1.joblib are present (or let fallback auto-train a tiny model)
+
+3) streamlit run app_streamlit.py
+
+import os import re import io import json import base64 import pandas as pd import numpy as np import streamlit as st from typing import List, Dict
+
+--- Local high-tech model ---
+
+try: from phishing_hitech import HighTechPhish HAVE_HITECH = True except Exception as e: HAVE_HITECH = False st.warning("Could not import phishing_hitech.HighTechPhish. Fallback model will be used. Error: %s" % e)
+
+--- Minimal fallback (char TF-IDF + LinearSVC calibrated) ---
+
+from sklearn.feature_extraction.text import TfidfVectorizer from sklearn.svm import LinearSVC from sklearn.calibration import CalibratedClassifierCV from sklearn.pipeline import Pipeline from sklearn.model_selection import train_test_split from sklearn.metrics import classification_report
+
+import joblib import warnings warnings.filterwarnings("ignore")
+
+URL_RE = re.compile(r'https?://[^\s<>)"]+')
+
+------------------ Helpers ------------------
+
+EXAMPLE_TEXTS = [ "Verify your Microsoft account urgently: http://bad.link/login", "Team meeting at 3 PM. Agenda attached.", "Your package is on hold. Update payment now: http://suspicious.ru/pay", '<html><body>Reset your password <a href="http://secure-update.xyz/reset">here</a></body></html>', ]
+
+def parse_eml(file_bytes: bytes) -> str: try: import email msg = email.message_from_bytes(file_bytes) body_parts = [] if msg.is_multipart(): for part in msg.walk(): ctype = part.get_content_type() if ctype in ("text/plain", "text/html"): try: payload = part.get_payload(decode=True) if payload: body_parts.append(payload.decode(part.get_content_charset() or "utf-8", errors="ignore")) except Exception: pass else: payload = msg.get_payload(decode=True) if payload: body_parts.append(payload.decode(msg.get_content_charset() or "utf-8", errors="ignore")) text = "\n\n".join(body_parts) return text if text.strip() else msg.as_string() except Exception as e: return ""
+
+def extract_urls(text: str) -> List[str]: return URL_RE.findall(text or "")
+
+Fallback model trainer
+
+class FallbackModel: def init(self, threshold: float = 0.5): self.threshold = threshold base = LinearSVC(C=1.0, class_weight="balanced") self.pipe = Pipeline([ ("tfidf", TfidfVectorizer(analyzer="char", ngram_range=(3,5))), ("clf", CalibratedClassifierCV(base, method="sigmoid", cv=3)), ]) self.fitted = False
+
+def fit(self, texts: List[str], labels: List[int]):
+    self.pipe.fit(texts, labels)
+    self.fitted = True
+    return self
+
+def predict_proba(self, texts: List[str]) -> np.ndarray:
+    p = self.pipe.predict_proba(texts)[:, 1]
+    return p
+
+def predict(self, texts: List[str]) -> np.ndarray:
+    p = self.predict_proba(texts)
+    return (p >= self.threshold).astype(int)
+
+------------------ UI ------------------
+
+st.set_page_config(page_title="Phishing Detector (High-Tech)", page_icon="🔐", layout="wide") st.title("🔐 Phishing Email Detector — High‑Tech GUI (v3)") st.caption("Hybrid model • Explainability • Batch scoring • .eml support")
+
+with st.sidebar: st.header("⚙️ Settings") threshold = st.slider("Decision Threshold (phishing if ≥)", 0.05, 0.95, 0.35, 0.01) st.write("\nModel status:") model_path = st.text_input("Model path", value="models/phishing_hitech_v1.joblib")
+
+load_clicked = st.button("🔄 Load Model")
+train_clicked = st.button("🧪 Train Tiny Fallback (demo)")
+
+Global model object
+
+if 'model_obj' not in st.session_state: st.session_state.model_obj = None st.session_state.is_hitech = False
+
+Load model
+
+if load_clicked: try: if HAVE_HITECH and os.path.exists(model_path): m = HighTechPhish() m.load(model_path) m.threshold = threshold st.session_state.model_obj = m st.session_state.is_hitech = True st.success(f"Loaded High‑Tech model from {model_path}") else: st.error("High‑Tech model not found. Use training fallback or place the joblib file.") except Exception as e: st.exception(e)
+
+Train fallback
+
+if train_clicked or st.session_state.model_obj is None: # Tiny demo dataset data = pd.DataFrame([ {"text": EXAMPLE_TEXTS[0], "label": 1}, {"text": EXAMPLE_TEXTS[1], "label": 0}, {"text": EXAMPLE_TEXTS[2], "label": 1}, {"text": EXAMPLE_TEXTS[3], "label": 1}, {"text": "Invoice for last month attached. Thank you.", "label": 0}, {"text": "Project status: all green. Next review Monday.", "label": 0}, ]) fb = FallbackModel(threshold=threshold) fb.fit(data.text.tolist(), data.label.tolist()) st.session_state.model_obj = fb st.session_state.is_hitech = False st.info("Using tiny fallback model (demo). Load the High‑Tech model from sidebar when ready.")
+
+------------------ Tabs ------------------
+
+Tab = st.tabs(["🔍 Single Check", "📁 Batch CSV", "🧠 About & Tips"])  # type: ignore
+
+---- Single Check ----
+
+with Tab[0]: st.subheader("Analyze a single email") col1, col2 = st.columns([2,1]) with col1: text_input = st.text_area("Paste email text / HTML:", height=260, placeholder="Paste email body here…") up = st.file_uploader("or upload .eml / .txt", type=["eml","txt"], accept_multiple_files=False) if up is not None and not text_input.strip(): if up.type == "text/plain": text_input = up.getvalue().decode("utf-8", errors="ignore") else: text_input = parse_eml(up.getvalue()) ex = st.selectbox("Examples", ["None"] + EXAMPLE_TEXTS) if ex != "None" and not text_input.strip(): text_input = ex with col2: st.markdown("Model") st.write("High‑Tech" if st.session_state.is_hitech else "Fallback (demo)") st.markdown("Threshold") st.write(threshold) st.markdown("Actions") run_single = st.button("🚀 Analyze")
+
+if run_single and text_input.strip():
+    model = st.session_state.model_obj
+    # set threshold live if model supports it
+    if hasattr(model, 'threshold'):
+        model.threshold = threshold
+    proba = float(model.predict_proba([text_input])[0])
+    pred = int(proba >= threshold)
+
+    colA, colB = st.columns([1,1])
+    with colA:
+        st.metric("Prob (phishing)", f"{proba:.2f}", help="Calibrated probability when available")
+        st.metric("Decision", "PHISHING ⚠️" if pred==1 else "LEGIT ✅")
+    with colB:
+        urls = extract_urls(text_input)
+        df_urls = pd.DataFrame({"urls": urls}) if urls else pd.DataFrame({"urls": []})
+        st.write("**Extracted URLs**")
+        st.dataframe(df_urls, use_container_width=True)
+
+    # Explanations (only for High‑Tech)
+    if st.session_state.is_hitech:
+        try:
+            expl = model.explain([text_input], top_k=8)[0]
+            st.markdown("### 🔎 Explanation")
+            c1, c2 = st.columns([1,1])
+            with c1:
+                st.write("**Top char n‑grams (contrib)**")
+                if expl.get("top_char_ngrams"):
+                    st.dataframe(pd.DataFrame(expl["top_char_ngrams"], columns=["n‑gram","contribution"]))
+                else:
+                    st.caption("(No n‑gram explanation available)")
+            with c2:
+                st.write("**Security features**")
+                sec_df = pd.DataFrame([expl.get("security_feats", {})]).T
+                sec_df.columns = ["value"]
+                st.dataframe(sec_df)
+            st.write("**Signals**: ",
+                     f"urgent_hits={expl.get('urgent_hits')}, brands={', '.join(expl.get('brands_found', []))}")
+        except Exception as e:
+            st.caption("(Explanation not available)")
+
+---- Batch CSV ----
+
+with Tab[1]: st.subheader("Score a CSV in batch") st.caption("Upload a CSV with a text column. We'll return probability, decision, and URLs found.") csv_up = st.file_uploader("Upload CSV", type=["csv"], accept_multiple_files=False, key="batch") if csv_up is not None: try: df = pd.read_csv(csv_up) assert 'text' in df.columns, "CSV must contain a 'text' column" model = st.session_state.model_obj if hasattr(model, 'threshold'): model.threshold = threshold probs = model.predict_proba(df['text'].astype(str).tolist()) preds = (probs >= threshold).astype(int) df_out = df.copy() df_out['prob_phish'] = probs df_out['prediction'] = np.where(preds==1, 'phishing', 'legit') df_out['num_urls'] = df_out['text'].astype(str).apply(lambda t: len(extract_urls(t))) st.write("Preview") st.dataframe(df_out.head(50), use_container_width=True) # Download link csv_bytes = df_out.to_csv(index=False).encode('utf-8') b64 = base64.b64encode(csv_bytes).decode() st.download_button("⬇️ Download Scored CSV", data=csv_bytes, file_name="scored_emails.csv", mime="text/csv") except Exception as e: st.exception(e)
+
+---- About ----
+
+with Tab[2]: st.markdown(""" ### 🧠 About this app High‑Tech Phishing Detector combines multiple views of the email: - Character n‑grams (robust to obfuscation) - Transformer embeddings (semantic understanding) - Security heuristics (URLs, TLDs, forms, digits, urgency, brand bait)
+
+It uses stacking + probability calibration (when available) and an adjustable threshold to favor **recall** (catch more phishing).
+
+**Tips**
+- Lower the threshold (e.g., 0.25–0.35) to reduce misses; expect more false positives.
+- Train with **real, diverse samples**; include HTML and obfuscated variants.
+- Periodically re‑train and validate; store metrics alongside the model.
+
+**Files expected**
+- `phishing_hitech.py` — high‑tech model definition
+- `models/phishing_hitech_v1.joblib` — trained weights
+
+Use the sidebar to load the high‑tech model. Until then, a tiny fallback is used for demo.
+""")
+
