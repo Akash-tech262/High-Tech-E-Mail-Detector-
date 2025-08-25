@@ -1,4 +1,4 @@
-# High-Tech-E-Mail-Detector-
+# High Tech E-Mail Detector
 
 # pip install scikit-learn pandas joblib
 import re, joblib, pandas as pd
